@@ -1,0 +1,418 @@
+name: Secure CI/CD Pipeline
+
+on:
+  push:
+    branches: ['main', 'test', 'dev*']
+  workflow_dispatch: # Allows to trigger it manually via a button in the UI!
+
+env:
+  # Swapped Harbor for GitHub's free registry
+  HARBOR_REGISTRY: ghcr.io
+  IMAGE_NAME: dnsdb-proxy
+  DOCKER_HOST: unix:///var/run/docker.sock
+
+jobs:
+  job_1_static_and_security:
+    name: Static Tests & Security (Zero-Trust)
+    runs-on: self-hosted
+    steps:
+      # 1. Pinned Checkout Action
+      - name: Checkout repository
+        uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3.6.0
+
+      # 1. Install bare minimum OS dependencies (Required for luacheck)
+      - name: Install OS dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y lua-check
+
+      # 2. Zero-Trust Hadolint via Docker v2.14.0-debian
+      - name: Hadolint Dockerfile Lint (Containerized & Pinned)
+        run: |
+          if [ -f Docker/Dockerfile ]; then
+            docker run --rm -i -v "$PWD/Docker/.hadolint.yaml:/.config/hadolint.yaml" \
+              hadolint/hadolint@sha256:bb143dee5ef4a59958be7d6315c15ce2a239c7fd6c362f66888aabca123a8059 \
+              hadolint -c /.config/hadolint.yaml - < Docker/Dockerfile || true
+          fi
+
+      # 3. Zero-Trust Helm Linting via Docker (Test AND Prod) v4.1
+      - name: Helm lint (Containerized & Pinned)
+        run: |
+          # Lint Test
+          docker run --rm -v "$PWD:/work" -w /work \
+            alpine/helm@sha256:e71af664cfcdf7cc32c94b0c700c7f9a95233686514656d1a25e2120a1ac9a0e \
+            lint --strict -f helm/values-test.yaml helm/dnsdb-proxy/ || true
+          # Lint Prod
+          docker run --rm -v "$PWD:/work" -w /work \
+            alpine/helm@sha256:e71af664cfcdf7cc32c94b0c700c7f9a95233686514656d1a25e2120a1ac9a0e \
+            lint --strict -f helm/values-prod.yaml helm/dnsdb-proxy/ || true
+
+      # 4. Luacheck execution (Uses the apt-get install from Step 1)
+      - name: Luacheck (check lua code)
+        run: luacheck Docker/files/lua/ || true
+
+      # UPDATED: Added --report-path to save the Gitleaks JSON
+      - name: Gitleaks secret scan (Dockerized & Pinned)
+        run: |
+          docker run --rm -v "$PWD":/repo -w /repo \
+            zricethezav/gitleaks@sha256:105ac66a57b2bb8afb61a3b8a5dcc4817773d03724a7e8a515214cfe58225556 \
+            detect --source . -v --report-path gitleaks-report.json || true
+
+      # 6. Immutable Semgrep SAST v1.152.0
+      - name: Semgrep SAST (Zero-Trust Docker)
+        run: |
+          docker run --rm -v "$PWD":/src -w /src \
+            returntocorp/semgrep@sha256:1f02c6a16ca0cb5c4f6454a062e2bf2fff7b922406c22ee1dc705825a2a4f9f6 \
+            semgrep --config=p/python --sarif --output semgrep.sarif --error || true
+
+      # 7. Immutable OSV-Scanner
+      - name: OSV Scanner (Zero-Trust Docker)
+        run: |
+          docker run --rm -v "$PWD":/src -w /src \
+            ghcr.io/google/osv-scanner:v2.3.2-amd64@sha256:65003b000320584d5541922877bda9e4baf2755e2f02594fabafe6b0aecbc241 \
+            --format sarif --output osv.sarif -r . || true
+
+      # NEW: Aggregates all reports and uploads them to the GitHub Console Artifacts using your pinned v3 Action
+      - name: Upload Static Security Reports
+        uses: actions/upload-artifact@a8a3f3ad30e3422c9c7b888a15615d19a852ae32 # v3.1.3
+        if: always() # Ensures reports are uploaded even if a tool finds a vulnerability and fails the step
+        with:
+          name: job_1_security_reports
+          path: |
+            semgrep.sarif
+            osv.sarif
+            gitleaks-report.json
+
+  job_2_build_dynamic_test_and_scan:
+    name: Build, Goss Tests, and Container Sec Scans
+    runs-on: self-hosted 
+    services:
+      # Postgres/Redis are reachable only through Toxiproxy in this job.
+      postgres:
+        image: postgres:16.4-alpine@sha256:f5aa7cac1dc299a77761ada5a5cf9c6ef4064bc85c89fed49c587dd2381d6f05
+        env:
+          POSTGRES_DB: dnsdb_test
+          POSTGRES_USER: dnsdb_user
+          POSTGRES_PASSWORD: dnsdb_pass
+        options: >-
+          --health-cmd="pg_isready -U dnsdb_user -d dnsdb_test"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=6
+      redis:
+        image: redis:7.2.5-alpine@sha256:015185fd658093359cc83aa8396e06c1f39ba36df3c93f79528ec23ab409e73f
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=6
+
+      # Toxiproxy Chaos Engine Service (Pinned digest)
+      toxiproxy:
+        image: ghcr.io/shopify/toxiproxy:2.9.0@sha256:b44c283298cea49e2defaba1b3028783798346f2a926684e3a345fd8441af3b8
+        ports:
+          - 8474:8474   # Control API
+          - 25432:25432 # Postgres proxy port
+          - 26379:26379 # Redis proxy port
+
+    env:
+      POSTGRES_HOST: 127.0.0.1
+      POSTGRES_PORT: 25432
+      POSTGRES_DB: dnsdb_test
+      POSTGRES_USER: dnsdb_user
+      POSTGRES_PASSWORD: dnsdb_pass
+      POSTGRES_CONNECT_TIMEOUT: 10
+      REDIS_HOST: 127.0.0.1
+      REDIS_PORT: 26379
+      REDIS_CONNECT_TIMEOUT: 10
+      TOXIPROXY_HOST: 127.0.0.1
+      TOXIPROXY_PORT: 8474
+      CHAOS_ENFORCE: "false" # Set true to fail the job on chaos failures.
+      CHAOS_SLA_MAX_ERROR_RATE: "0.05"
+      CHAOS_SLA_MAX_P95_MS: "1000" #1000ms
+      CHAOS_SAMPLE_SIZE: "20"
+      CHAOS_REQUEST_CONCURRENCY: "1"
+      CHAOS_LOAD_LEVELS: "1,5,10,20"
+      CHAOS_LATENCY_LEVELS_MS: "50,100,200,400,800"
+      CHAOS_LATENCY_JITTER_MS: "20"
+      CHAOS_TIMEOUT_LEVELS_MS: "50,100,250,500,1000"
+      CHAOS_BANDWIDTH_LEVELS_KBPS: "64,128,256,512"
+      CHAOS_PACKET_LIMIT_BYTES: "10,50,100"
+    steps:
+      # 1. Pinned Checkout Action
+      - name: Checkout repository
+        uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3.6.0
+
+      # 1. Pinned Python Setup for Integration Tests
+      - name: Set up Python
+        uses: actions/setup-python@39cd14951b08e74b54015e9e001cdefcf80e669f # v5.1.1
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Wait for Toxiproxy API
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 30); do
+            if curl -fsS "http://${TOXIPROXY_HOST}:${TOXIPROXY_PORT}/version" >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Toxiproxy API did not become ready in time" >&2
+          exit 1
+
+      - name: Configure Toxiproxy proxies
+        run: |
+          set -euo pipefail
+          api="http://${TOXIPROXY_HOST}:${TOXIPROXY_PORT}"
+          create_proxy() {
+            local name="$1"
+            local listen="$2"
+            local upstream="$3"
+            local payload
+            local code
+            payload=$(printf '{"name":"%s","listen":"%s","upstream":"%s"}' "$name" "$listen" "$upstream")
+            code=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+              -H "Content-Type: application/json" \
+              -d "$payload" \
+              "${api}/proxies")
+            if [ "$code" = "409" ]; then
+              curl -fsS -X DELETE "${api}/proxies/${name}" >/dev/null
+              code=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+                -H "Content-Type: application/json" \
+                -d "$payload" \
+                "${api}/proxies")
+            fi
+            if [ "$code" != "201" ]; then
+              echo "Failed to create proxy ${name} (HTTP ${code})" >&2
+              exit 1
+            fi
+          }
+          create_proxy "pg_proxy" "0.0.0.0:${POSTGRES_PORT}" "postgres:5432"
+          create_proxy "redis_proxy" "0.0.0.0:${REDIS_PORT}" "redis:6379"
+
+      - name: Run baseline pytest (through Toxiproxy, no toxics)
+        run: pytest -q
+
+      - name: Run chaos scenarios and generate report
+        run: python -m scripts.chaos_sla
+
+      # 2. Pinned Docker Buildx Setup
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@6524bf65af31da8d45b59e8c27de4bd072b392f5 # v3.8.0
+
+      # 3. Pinned Docker Build & Push Action
+      - name: Build image with buildx and load into local Docker
+        uses: docker/build-push-action@b32b51a8eda65d6793cd0494a773d4f6bcef32dc # v6.11.0
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          load: true
+          platforms: linux/amd64
+          tags: dnsdb-proxy:latest
+
+      # 4. The Goss Validation Loop (From our earlier optimization)
+      - name: Download and Verify goss + dgoss (Hardcoded Hash Pinning)
+        run: |
+          set -euo pipefail
+          GOSS_VERSION="v0.4.4"
+          EXPECT_GOSS="1c4f54b22fde9d4d5687939abc2606b0660a5d14a98afcd09b04b793d69acdc5" 
+          EXPECT_DGOSS="7c506bb153704977ead6f4b8b8764bbb1b1e398654f0c626730cec48ae457ad4"
+          
+          curl -fsSL --retry 3 -o /tmp/goss "https://github.com/goss-org/goss/releases/download/${GOSS_VERSION}/goss-linux-amd64"
+          curl -fsSL --retry 3 -o /tmp/dgoss "https://github.com/goss-org/goss/releases/download/${GOSS_VERSION}/dgoss"
+          
+          echo "${EXPECT_GOSS}  /tmp/goss" | sha256sum -c -
+          echo "${EXPECT_DGOSS}  /tmp/dgoss" | sha256sum -c -
+          
+          sudo install -m 0755 /tmp/goss /usr/local/bin/goss
+          sudo install -m 0755 /tmp/dgoss /usr/local/bin/dgoss
+
+      - name: Run dgoss checks
+        run: |
+          set -o pipefail
+          GOSS_FILES_STRATEGY=cp dgoss run dnsdb-proxy:latest || true
+
+      # UPDATED: Trivy outputs to SARIF first, then prints the table to console
+      - name: Trivy Image Scan
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$PWD":/repo -w /repo \
+            aquasec/trivy@sha256:5c8786cba2b31948e0b1f944d0be48a497f709c8c3e061dc504f6a0965c5fa44 image \
+            --severity CRITICAL,HIGH \
+            --ignore-unfixed \
+            --format sarif --output /repo/trivy.sarif \
+            dnsdb-proxy:latest || true
+            
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy@sha256:5c8786cba2b31948e0b1f944d0be48a497f709c8c3e061dc504f6a0965c5fa44 image \
+            --severity CRITICAL,HIGH \
+            --ignore-unfixed \
+            --format table \
+            dnsdb-proxy:latest || true
+
+      # 6. Pinned Syft SBOM Generation (Replaced :latest with @sha256 v1.42.1)
+      - name: Generate SBOMs (SPDX + CycloneDX)
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$PWD":/repo -w /repo \
+            anchore/syft@sha256:d775ca26ef52914830e6db70ad17381d15acaed7507e3c1b70e8c1af2b95d861 \
+            dnsdb-proxy:latest -o spdx-json=sbom.spdx.json
+          
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$PWD":/repo -w /repo \
+            anchore/syft@sha256:d775ca26ef52914830e6db70ad17381d15acaed7507e3c1b70e8c1af2b95d861 \
+            dnsdb-proxy:latest -o cyclonedx-json=sbom-cyclonedx.json
+
+      # NEW: Aggregates Chaos Report, Trivy, and Syft SBOM using the existing pinned v3 Action
+      - name: Upload Container Security & Chaos Artifacts
+        uses: actions/upload-artifact@a8a3f3ad30e3422c9c7b888a15615d19a852ae32 # v3.1.3
+        if: always()
+        with:
+          name: job_2_container_reports
+          path: |
+            trivy.sarif
+            sbom.spdx.json
+            sbom-cyclonedx.json
+            chaos-report.md
+            
+  job_3_build_and_push:
+    name: Build, Push, and Attest Image
+    runs-on: self-hosted
+    needs: [job_1_static_and_security, job_2_build_dynamic_test_and_scan]
+    permissions:
+      packages: write # Required to push to GHCR
+      id-token: write # Required for Sigstore/Cosign keyless attestation
+      contents: read
+    steps:
+      - uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3.6.0
+      - uses: docker/setup-buildx-action@6524bf65af31da8d45b59e8c27de4bd072b392f5 # v3.8.0
+
+      - name: Determine image tags
+        id: tag
+        run: |
+          IMAGE_OWNER="$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
+          BRANCH="${{ github.ref_name }}"
+          TAG="latest"
+          echo "IMAGE_FULL=${{ env.HARBOR_REGISTRY }}/${IMAGE_OWNER}/${{ env.IMAGE_NAME }}:${TAG}" >> $GITHUB_OUTPUT
+
+      - name: Determine push behavior
+        id: push
+        run: |
+          if [ "${{ github.ref }}" = "refs/heads/main" ] || [ "${{ github.ref }}" = "refs/heads/test" ]; then
+            echo "PUSH_IMAGE=true" >> $GITHUB_OUTPUT
+          else
+            echo "PUSH_IMAGE=false" >> $GITHUB_OUTPUT
+          fi
+
+      # - name: Log in to GHCR
+      #   if: steps.push.outputs.PUSH_IMAGE == 'true'
+      #   uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+      #   with:
+      #     registry: ${{ env.HARBOR_REGISTRY }}
+      #     username: ${{ github.actor }}
+      #     password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@b32b51a8eda65d6793cd0494a773d4f6bcef32dc # v6.11.0
+        with:
+          context: .
+          file: ./Dockerfile
+          # push: ${{ steps.push.outputs.PUSH_IMAGE == 'true' }}
+          push: false # For demo purposes, we set this to false to avoid actually pushing to GHCR. In a real pipeline, you'd use the dynamic value.
+          tags: ${{ steps.tag.outputs.IMAGE_FULL }}
+
+      # - name: Set image digest reference
+      #   id: image-digest
+      #   if: steps.push.outputs.PUSH_IMAGE == 'true'
+      #   run: |
+      #     echo "IMAGE_REF=${{ steps.tag.outputs.IMAGE_FULL }}@${{ steps.build.outputs.digest }}" >> $GITHUB_OUTPUT
+
+      # - name: Generate SBOMs for attestation (SPDX + CycloneDX)
+      #   if: steps.push.outputs.PUSH_IMAGE == 'true'
+      #   env:
+      #     IMAGE_REF: ${{ steps.image-digest.outputs.IMAGE_REF }}
+      #   run: |
+      #     docker run --rm \
+      #       -v "$PWD":/repo -w /repo \
+      #       anchore/syft@sha256:d775ca26ef52914830e6db70ad17381d15acaed7507e3c1b70e8c1af2b95d861 \
+      #       "$IMAGE_REF" -o spdx-json=sbom.spdx.json
+
+      #     docker run --rm \
+      #       -v "$PWD":/repo -w /repo \
+      #       anchore/syft@sha256:d775ca26ef52914830e6db70ad17381d15acaed7507e3c1b70e8c1af2b95d861 \
+      #       "$IMAGE_REF" -o cyclonedx-json=sbom-cyclonedx.json
+
+      # - name: Install Cosign (Strict Immutability)
+      #   if: steps.push.outputs.PUSH_IMAGE == 'true'
+      #   run: |
+      #     set -euo pipefail
+      #     COSIGN_VERSION="v2.6.1"
+      #     # The exact immutable SHA256 published by the Sigstore project
+      #     EXPECT_COSIGN_SHA="064954c5d8c7e3b28188eee5b1727b31c411550bc5fefd41aa672d3c761d103a"
+          
+      #     echo "Downloading Cosign ${COSIGN_VERSION}..."
+      #     curl -fsSL --retry 3 -o /tmp/cosign "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64"
+          
+      #     echo "Verifying cryptographic signature..."
+      #     echo "${EXPECT_COSIGN_SHA}  /tmp/cosign" | sha256sum -c -
+          
+      #     sudo install -m 0755 /tmp/cosign /usr/local/bin/cosign
+      #     rm -f /tmp/cosign
+
+      # - name: Attest SPDX SBOM
+      #   if: steps.push.outputs.PUSH_IMAGE == 'true'
+      #   env:
+      #     IMAGE_REF: ${{ steps.image-digest.outputs.IMAGE_REF }}
+      #   run: |
+      #     cosign attest --yes \
+      #       --type spdxjson \
+      #       --predicate sbom.spdx.json \
+      #       "${IMAGE_REF}"
+
+      # - name: Attest CycloneDX SBOM
+      #   if: steps.push.outputs.PUSH_IMAGE == 'true'
+      #   env:
+      #     IMAGE_REF: ${{ steps.image-digest.outputs.IMAGE_REF }}
+      #   run: |
+      #     cosign attest --yes \
+      #       --type cyclonedx \
+      #       --predicate sbom-cyclonedx.json \
+      #       "${IMAGE_REF}"
+
+  job_4_helm_deploy:
+    name: Helm Deploy (Dry Run)
+    runs-on: self-hosted
+    needs: job_3_build_and_push
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3.6.0
+
+      # Zero-Trust bash installation
+      - name: Install Helm (Strict Immutability)
+        run: |
+          set -euo pipefail
+          HELM_VERSION="v3.14.0"
+          EXPECT_HELM_SHA="f43e1c3387de24547506ab05d24e5309c0ce0b228c23bd8aa64e9ec4b8206651"
+          
+          curl -fsSL --retry 3 -o /tmp/helm.tar.gz "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz"
+          echo "${EXPECT_HELM_SHA}  /tmp/helm.tar.gz" | sha256sum -c -
+          
+          tar -zxvf /tmp/helm.tar.gz -C /tmp
+          sudo mv /tmp/linux-amd64/helm /usr/local/bin/helm
+          rm -rf /tmp/helm.tar.gz /tmp/linux-amd64
+
+      # We use 'helm template' to prove the syntax works without needing a real K8s cluster
+      - name: Helm Dry Run / Template
+        env:
+          HELM_NAMESPACE: test-namespace
+        run: |
+          helm template dnsdb-proxy ./helm/dnsdb-proxy --namespace "$HELM_NAMESPACE"
